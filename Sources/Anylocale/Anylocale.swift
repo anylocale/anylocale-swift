@@ -1,0 +1,619 @@
+import Combine
+import Foundation
+
+// FIXME: This should be a struct to avoid breaking changes when adding a new case
+// Or use that unfrozen enums feature when available
+
+/// Errors that can occur within the Anylocale SDK.
+public enum AnylocaleError: Error {
+    case invalidJSONString
+    case translationNotFound
+    case unsupportedLocale
+    case sdkNotInitialized
+}
+
+/// The main Anylocale SDK class for handling localization and translations.
+///
+/// Anylocale provides a modern localization solution that supports:
+/// - Remote translation loading from CDN
+/// - Namespace-based translation organization
+/// - Fallback to bundle-based localizations
+/// - Automatic language detection from device settings
+///
+/// ## Quick Start
+/// ```swift
+/// // Automatic language detection (recommended for production)
+/// Anylocale.shared.initialize(
+///     cdn: URL(string: "https://cdn.anylocale.io/your-project-id")!
+/// )
+///
+/// // Fetch latest translations
+/// await Anylocale.shared.remoteFetch()
+///
+/// // Use translations in your app
+/// let greeting = Anylocale.shared.translate("hello_world")
+/// let personalGreeting = Anylocale.shared.translate("hello_name", "Alice")
+/// ```
+@MainActor
+public final class Anylocale {
+    /// Shared singleton instance of Anylocale for convenient access throughout your app.
+    public static let shared = Anylocale(
+        urlSession: URLSession(configuration: .default),
+        cache: FileCache(),
+        appVersionSignature: getAppVersionSignature(),
+        bundleForLanguageDetection: .main)
+
+    // table - [key - TranslationEntry]
+    private var translations: [String: [String: TranslationEntry]] = [:]
+    private var cdnEtags: [String: String] = [:]
+    private var cdnURL: URL?
+
+    private var language: String?
+    private var namespaces: Set<String> = []
+
+    private var customLocale: Locale? = nil
+    private var customLocalLanguage: String? = nil
+
+    /// The active locale used by the SDK.
+    ///
+    /// This property returns the current locale being used by the Anylocale SDK:
+    /// - If a custom locale has been set via ``initialize(cdn:locale:language:namespaces:enableDebugLogs:)``
+    ///   or ``setCustomLocale(_:language:)``, that locale is returned
+    /// - Otherwise, returns the system's current locale (`Locale.current`)
+    public var locale: Locale {
+        if let customLocale {
+            return customLocale
+        } else {
+            return Locale.current
+        }
+    }
+
+    private let logger = AnylocaleLog()
+
+    private let fetchCdnService: FetchCdnService
+    private let cache: CacheProtocol
+    // TODO: Make bundle repository mockable for testing
+    private let bundleRepository = BundleRepository()
+    private let bundleForLanguageDetection: Bundle
+
+    /// Indicates whether the Anylocale SDK has been initialized.
+    ///
+    /// This property becomes `true` after the first successful call to `initialize(cdn:locale:language:namespaces:enableDebugLogs:)`.
+    /// Subsequent initialization attempts will be ignored while this remains `true`.
+    private(set) public var isInitialized = false
+
+    /// The timestamp of the last successful translation fetch from the CDN.
+    ///
+    /// This property is `nil` until the first successful CDN fetch completes. It's updated
+    /// each time translations are successfully retrieved from the remote CDN via `remoteFetch()`.
+    private(set) public var lastFetchDate: Date?
+
+    private var appVersionSignature: String? = nil
+
+    private var onTranslationsUpdatedSubscribers: [ContinuationWrapper<()>] = []
+    /// Creates a stream for observing when translations are updated.
+    ///
+    /// This stream emits a value whenever translations are updated, either through
+    /// ``remoteFetch()`` or ``setCustomLocale(_:language:)``.
+    ///
+    /// - Returns: An async stream that yields whenever translations are updated
+    public func onTranslationsUpdated() -> AsyncStream<()> {
+        AsyncStream<()> { continuation in
+            let wrapper = ContinuationWrapper<()>(continuation: continuation)
+
+            self.onTranslationsUpdatedSubscribers.append(wrapper)
+
+            // Handle termination
+            continuation.onTermination = { [weak self] reason in
+                DispatchQueue.main.async { [weak self] in
+                    wrapper.markDead()
+                    self?.onTranslationsUpdatedSubscribers.removeAll { !$0.isAlive }
+                }
+            }
+        }
+    }
+
+    /// Creates a stream for observing log messages emitted by the Anylocale SDK.
+    ///
+    /// - Returns: An async stream of ``LogMessage`` values containing log information
+    public func onLogMessage() -> AsyncStream<LogMessage> {
+        logger.onLogMessage()
+    }
+
+    init(
+        urlSession: URLSessionProtocol, cache: CacheProtocol,
+        appVersionSignature: String?,
+        bundleForLanguageDetection: Bundle
+    ) {
+        self.appVersionSignature = appVersionSignature
+        self.fetchCdnService = FetchCdnService(urlSession: urlSession)
+        self.cache = cache
+        self.bundleForLanguageDetection = bundleForLanguageDetection
+    }
+
+    /// Initializes the Anylocale SDK.
+    ///
+    /// This method provides flexible initialization options:
+    /// - **Automatic language detection** (recommended): When `language` is `nil`, automatically detects
+    ///   the user's preferred language from device settings
+    /// - **Manual language specification**: When `language` is provided, uses that specific language
+    ///   regardless of device settings
+    ///
+    /// The method loads cached translations immediately if available.
+    ///
+    /// - Parameters:
+    ///   - cdn: The base URL of the Anylocale CDN where translation files are hosted
+    ///   - locale: Custom locale to use for translations and formatting (defaults to `.current`)
+    ///   - language: The target language code on the Anylocale CDN (e.g., "en", "pt-BR", "cs"). Use this to override the locale's language when it differs from the CDN language code.
+    ///   - namespaces: A set of namespace identifiers for organizing translations into logical groups (defaults to empty set)
+    ///   - enableDebugLogs: Whether to enable debug logging (defaults to `false`)
+    ///
+    /// ## Usage
+    /// ```swift
+    /// let cdnURL = URL(string: "https://cdn.anylocale.io/your-project-id")!
+    /// Anylocale.shared.initialize(cdn: cdnURL)
+    /// try await Anylocale.shared.remoteFetch()
+    /// ```
+    public func initialize(
+        cdn: URL,
+        locale customLocale: Locale = .current,
+        language customCdnLanguage: String? = nil,
+        namespaces: Set<String> = [],
+        enableDebugLogs: Bool = false
+    ) {
+
+        guard !isInitialized else {
+            logger.error("Anylocale is already initialized")
+            return
+        }
+
+        logger.enableDebugLogs = enableDebugLogs
+
+        if ProcessInfo.processInfo.environment["ANYLOCALE_ENABLE_SWIZZLING"] == "true" {
+            logger.debug("Swizzling Bundle methods (ANYLOCALE_ENABLE_SWIZZLING is set to true)")
+            Bundle.swizzle(translator: self)
+        }
+
+        let languages = try? resolveLanguages(from: customLocale)
+
+        self.language = customCdnLanguage ?? languages?.cdnLanguage
+
+        guard let language else {
+            logger.error("Language must be specified for Anylocale initialization")
+            return
+        }
+
+        if customLocale != .current {
+            guard let customLocalLanguage = languages?.localLanguage else {
+                logger.error(
+                    "The provided locale \(customLocale.identifier) is not supported by the app localizations"
+                )
+                return
+            }
+            self.customLocalLanguage = customLocalLanguage
+            self.customLocale = customLocale
+        }
+
+        cdnURL = cdn
+        self.namespaces = namespaces
+
+        loadMemoryCache()
+
+        isInitialized = true
+        logger.debug("Anylocale initialized with language: \(language), namespaces: \(namespaces)")
+    }
+
+    /// Fetches the latest translations from the CDN.
+    ///
+    /// This method explicitly fetches translations from the configured CDN URL. By default, it fetches the current
+    /// language and namespaces. It will update cached translations and notify observers when
+    /// the fetch completes. You can optionally specify a different language to fetch using the language parameter.
+    /// If you specify a different language than the current one, the translations will be prefetched but not applied.
+    ///
+    /// - Parameters:
+    ///   - language: An optional language code to fetch different from the current one.
+    ///     If provided, translations for this language will be fetched but not applied to the current state.
+    ///
+    /// - Note: This method requires that Anylocale has been initialized with a CDN URL.
+    ///   The method will return early if these prerequisites are not met.
+    public func remoteFetch(language fetchDifferentLanguage: String? = nil) async {
+        guard let cdnURL, let language, language.isEmpty == false else {
+            return
+        }
+
+        let languageBeingFetched = fetchDifferentLanguage ?? language
+
+        var cdnEtags = self.cdnEtags
+        if languageBeingFetched != language {
+            // Load etags from disk cache for the different language
+            let loadEtagsUseCase = LoadCdnEtagsUseCase(
+                language: languageBeingFetched,
+                namespaces: self.namespaces,
+                cdnURL: cdnURL.absoluteString,
+                cache: self.cache
+            )
+            cdnEtags = await Task.detached {
+                loadEtagsUseCase()
+            }.value
+        }
+
+        let fetchUseCase = RemoteFetchUseCase(
+            cdnURL: cdnURL,
+            language: languageBeingFetched,
+            namespaces: namespaces,
+            appVersionSignature: appVersionSignature,
+            cdnEtags: cdnEtags,
+            fetchCdnService: fetchCdnService,
+            cache: cache,
+            logger: logger)
+
+        do {
+            let response = try await Task.detached {
+                try await fetchUseCase()
+            }.value
+
+            guard self.language == languageBeingFetched else {
+                logger.debug(
+                    "Caching language \(languageBeingFetched) only to the disk"
+                )
+                return
+            }
+
+            try Task.checkCancellation()
+
+            for (table, translations) in response.translations {
+                self.translations[table] = translations
+            }
+
+            for (table, etag) in response.cdnEtags {
+                self.cdnEtags[table] = etag
+            }
+
+            self.lastFetchDate = Date()
+
+            logger.debug(
+                "Successfully updated in-memory translations from CDN for language: \(languageBeingFetched)"
+            )
+
+            self.onTranslationsUpdatedSubscribers.forEach {
+                $0.yield(())
+            }
+
+        } catch {
+            logger.error("Failed to fetch remote translations: \(error)")
+            return
+        }
+    }
+
+    /// Translates a given key to a localized string with optional format arguments.
+    ///
+    /// This method first attempts to find the translation in the loaded Anylocale translations,
+    /// including support for ICU plural forms and format specifiers. If not found, it falls
+    /// back to the bundle's localized string mechanism.
+    ///
+    /// - Parameters:
+    ///   - key: The translation key to look up
+    ///   - arguments: Variable arguments to substitute into the translated string (supports format specifiers like %@, %d, etc.)
+    ///   - table: The name of the strings table to search (optional, defaults to base table)
+    ///   - bundle: The bundle containing the strings file (defaults to main bundle)
+    ///   - locale: A custom locale to use for this specific translation (defaults to `.current`).
+    ///     This parameter is primarily intended for SwiftUI previews. When set to a non-current locale,
+    ///     translations from the CDN will be ignored and only bundle localizations will be used.
+    ///     Note: If a custom locale is set on the SDK level via ``setCustomLocale(_:language:)``,
+    ///     it will take precedence and this parameter will be ignored.
+    ///
+    /// - Returns: The localized string for the given key with arguments formatted, or the fallback value
+    ///
+    /// ## Usage
+    /// ```swift
+    /// // Simple translation
+    /// let greeting = anylocale.translate("hello_world")
+    ///
+    /// // Translation with arguments
+    /// let personalGreeting = anylocale.translate("hello_name", "Alice")
+    ///
+    /// // Translation with plural forms
+    /// let itemCount = anylocale.translate("item_count", 5)
+    ///
+    /// // Translation from specific table
+    /// let buttonText = anylocale.translate("save_button", table: "Buttons")
+    /// ```
+    public func translate(
+        _ key: String, _ arguments: CVarArg..., table: String? = nil, bundle: Bundle = .main,
+        locale providedLocale: Locale = .current
+    )
+        -> String
+    {
+        if providedLocale != .current && customLocale != nil {
+            logger.error(
+                "Both a custom locale is set on Anylocale and a different locale is provided in the translate() method. The custom locale on Anylocale will take precedence."
+            )
+        }
+
+        var customLocalLanguage = self.customLocalLanguage
+        let locale = customLocale ?? providedLocale
+        var canUseDataFromCdn = true
+
+        // Setting ccustom locale on SDK lavel overrides provided locale in method param
+        if customLocale == nil && providedLocale != .current {
+            guard let localLanguage = resolveLanguage(for: locale, in: bundleForLanguageDetection),
+                doesLocaleMatchLanguage(locale, language: localLanguage)
+            else {
+                logger.error(
+                    "The provided locale \(providedLocale.identifier) is not supported by the app localizations"
+                )
+                return key
+            }
+            customLocalLanguage = localLanguage
+            canUseDataFromCdn = false
+        }
+
+        if canUseDataFromCdn,
+            let remote = remoteTranslation(
+                forKey: key, arguments: arguments, table: table, locale: locale)
+        {
+            return remote
+        }
+
+        let bundle = localizedBundle(for: bundle, language: customLocalLanguage)
+
+        // !!! when swizzling is enabled, we use the original method to avoid infinite recursion
+        let localizedString = bundle.originalLocalizedString(forKey: key, value: nil, table: table)
+
+        // If we have arguments, try to format the string
+        if !arguments.isEmpty {
+            return String(format: localizedString, locale: locale, arguments: arguments)
+        }
+
+        return localizedString
+    }
+
+    func remoteTranslation(forKey key: String, table: String?) -> String? {
+        remoteTranslation(forKey: key, arguments: [], table: table, locale: locale)
+    }
+
+    private func remoteTranslation(
+        forKey key: String, arguments: [CVarArg], table: String?, locale: Locale
+    ) -> String? {
+        guard let translationEntry = translations[table ?? ""]?[key] else {
+            return nil
+        }
+
+        let format: String?
+        switch translationEntry {
+        case .simple(let string):
+            format = string
+        case .plural(let variants):
+            guard let number = arguments.compactMap({ $0 as? NSNumber }).first else {
+                return nil
+            }
+            format = variants.string(for: PluralRules(for: locale).category(for: number.doubleValue))
+        }
+
+        guard let format else {
+            return nil
+        }
+        if arguments.isEmpty {
+            return format
+        }
+        return String(format: format, locale: locale, arguments: arguments)
+    }
+
+    func localizedBundle(for bundle: Bundle) -> Bundle {
+        localizedBundle(for: bundle, language: customLocalLanguage)
+    }
+
+    private func localizedBundle(for bundle: Bundle, language: String?) -> Bundle {
+        guard let language else {
+            return bundle
+        }
+        guard
+            let replacementBundle = bundleRepository.bundle(for: language, referenceBundle: bundle)
+        else {
+            logger.error(
+                "No localization bundle found for locale \(customLocale?.identifier ?? "") in bundle \(bundle.bundlePath)"
+            )
+            return bundle
+        }
+        return replacementBundle
+    }
+
+    /// Clears all cached translations and ETag data.
+    ///
+    /// This method removes all cached files from the local cache,
+    /// forcing fresh downloads on the next `remoteFetch()` call.
+    ///
+    /// - Throws: An error if the cache clearing operation fails.
+    public func clearCaches() throws {
+        lastFetchDate = nil
+        translations.removeAll()
+        cdnEtags.removeAll()
+        try cache.clearAll()
+        logger.debug("Successfully cleared all cached translations and ETag data")
+    }
+
+    /// Sets a custom locale for translations and formatting.
+    ///
+    /// This method allows you to override the system locale with a custom locale for
+    /// translations, plural rules, and string formatting.
+    ///
+    /// When the language changes,
+    /// you should call ``remoteFetch()`` to fetch translations for the new language.
+    ///
+    /// - Parameters:
+    ///   - locale: The locale to use for translations and formatting. Pass `Locale.current`
+    ///     to reset to the system locale.
+    ///   - language: Optional language code on the Anylocale CDN (e.g., "en", "es", "cs"). If `nil`, the language
+    ///     is extracted from the locale. Use this to override the locale's language when it differs from the CDN language code.
+    ///
+    /// - Throws: ``AnylocaleError.sdkNotInitialized`` if the SDK has not been initialized,
+    ///   or ``AnylocaleError.unsupportedLocale`` if the locale is not supported by the app localizations.
+    ///
+    /// - Note: The SDK must be initialized before calling this method. If the locale
+    ///   is already set to the requested value, no action is taken.
+    ///
+    /// - Important: When the language changes, call ``remoteFetch()`` to fetch
+    ///   translations for the new language from the CDN.
+    public func setCustomLocale(_ locale: Locale, language cdnLanguage: String? = nil) throws {
+        guard isInitialized else {
+            logger.error("Anylocale must be initialized before setting a custom locale")
+            throw AnylocaleError.sdkNotInitialized
+        }
+
+        let needsLanguageChange: Bool
+        let didUpdateLocale: Bool
+
+        if locale == self.customLocale || (locale == .current && self.customLocale == nil) {
+            if cdnLanguage != self.language {
+                self.language = cdnLanguage
+                needsLanguageChange = true
+            } else {
+                needsLanguageChange = false
+            }
+            didUpdateLocale = false
+        } else {
+
+            let languages = try resolveLanguages(from: locale)
+
+            let newCdnLanguage = cdnLanguage ?? languages.cdnLanguage
+
+            needsLanguageChange = newCdnLanguage != self.language
+
+            self.language = newCdnLanguage
+
+            if locale == .current {
+                self.customLocale = nil
+                self.customLocalLanguage = nil
+            } else {
+                self.customLocale = locale
+                self.customLocalLanguage = languages.localLanguage
+            }
+            didUpdateLocale = true
+        }
+
+        if needsLanguageChange {
+            lastFetchDate = nil
+            translations.removeAll()
+            cdnEtags.removeAll()
+            loadMemoryCache()
+
+            onTranslationsUpdatedSubscribers.forEach {
+                $0.yield(())
+            }
+        } else if didUpdateLocale {
+            onTranslationsUpdatedSubscribers.forEach {
+                $0.yield(())
+            }
+        } else {
+            logger.debug("Custom locale is already set to \(locale.identifier), no changes made")
+            return
+        }
+
+        logger.debug("Set custom locale to \(locale.identifier)")
+    }
+
+    private func loadMemoryCache() {
+
+        guard let language else {
+            logger.error("Language must be specified to load memory cache")
+            return
+        }
+
+        guard let cdn = cdnURL else {
+            logger.error("CDN URL must be specified to load memory cache")
+            return
+        }
+
+        // Clear old cache files for base namespace
+        cache.clearOldCache(
+            descriptor: CacheDescriptor(
+                language: language, appVersionSignature: appVersionSignature,
+                cdn: cdn.absoluteString))
+
+        // Clear old cache files for all namespaces
+        for namespace in namespaces {
+            cache.clearOldCache(
+                descriptor: CacheDescriptor(
+                    language: language, namespace: namespace,
+                    appVersionSignature: appVersionSignature, cdn: cdn.absoluteString))
+        }
+
+        if let etag = cache.loadCdnEtag(for: .init(language: language, cdn: cdn.absoluteString)) {
+            cdnEtags[""] = etag
+            logger.debug(
+                "Loaded CDN ETag for language: \(language) and base namespace - ETag: \(etag)")
+        } else {
+            logger.debug("No CDN ETag found for language: \(language) and base namespace")
+        }
+
+        if let data = cache.loadRecords(
+            for: CacheDescriptor(
+                language: language, appVersionSignature: appVersionSignature,
+                cdn: cdn.absoluteString))
+        {
+            do {
+                // Load cached translations
+                let translations = try JSONParser.loadTranslations(from: data)
+                self.translations[""] = translations
+                logger.debug(
+                    "Loaded cached translations for language: \(language) and base namespace"
+                )
+            } catch {
+                logger.error("Failed to load cached translations: \(error)")
+            }
+        } else {
+            logger.debug("No cached translations found for language: \(language)")
+        }
+
+        for namespace in namespaces {
+
+            if let etag = cache.loadCdnEtag(
+                for: .init(language: language, namespace: namespace, cdn: cdn.absoluteString))
+            {
+                cdnEtags[namespace] = etag
+                logger.debug(
+                    "Loaded CDN ETag for language: \(language), namespace: \(namespace) - ETag: \(etag)"
+                )
+            } else {
+                logger.debug("No CDN ETag found for language: \(language), namespace: \(namespace)")
+            }
+
+            if let data = cache.loadRecords(
+                for: CacheDescriptor(
+                    language: language, namespace: namespace,
+                    appVersionSignature: appVersionSignature, cdn: cdn.absoluteString))
+            {
+                do {
+                    // Load cached translations for each namespace
+                    let translations = try JSONParser.loadTranslations(from: data)
+                    self.translations[namespace] = translations
+                    logger.debug(
+                        "Loaded cached translations for language: \(language), namespace: \(namespace)"
+                    )
+                } catch {
+                    logger.error(
+                        "Failed to load cached translations for namespace '\(namespace)': \(error)")
+                }
+            } else {
+                logger.debug(
+                    "No cached translations found for language: \(language), namespace: \(namespace)"
+                )
+            }
+        }
+    }
+
+    private func resolveLanguages(from locale: Locale)
+        throws -> (localLanguage: String, cdnLanguage: String)
+    {
+        if let localLanguage = resolveLanguage(for: locale, in: bundleForLanguageDetection),
+            doesLocaleMatchLanguage(locale, language: localLanguage)
+        {
+            return (localLanguage, localLanguageToCdnLanguage(localLanguage))
+        } else {
+            logger.error(
+                "The provided locale \(locale.identifier) is not supported by the app localizations"
+            )
+            throw AnylocaleError.unsupportedLocale
+        }
+    }
+}

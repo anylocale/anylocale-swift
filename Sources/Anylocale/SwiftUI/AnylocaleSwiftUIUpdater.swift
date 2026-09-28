@@ -1,0 +1,38 @@
+import Combine
+
+/// A SwiftUI-compatible observable object that automatically triggers re-renders of your SwiftUI hierarchy when translations change.
+///
+/// Use this class with SwiftUI views to ensure they automatically update when Anylocale translations are modified or reloaded.
+/// Simply inject this as an `@ObservedObject` or `@StateObject` in your SwiftUI views that display translated content.
+///
+/// Example usage:
+/// ```swift
+/// @main
+/// struct MyApp: App {
+///     @StateObject private var anylocaleUpdater = AnylocaleSwiftUIUpdater()
+///
+///     var body: some Scene {
+///         WindowGroup {
+///             ContentView()
+///                 .environmentObject(anylocaleUpdater)
+///         }
+///     }
+/// }
+/// ```
+@MainActor
+public final class AnylocaleSwiftUIUpdater: ObservableObject {
+
+    private var task: Task<Void, Never>? = nil
+
+    public init() {
+        task = Task { @MainActor [weak self] in
+            for await _ in Anylocale.shared.onTranslationsUpdated() {
+                self?.objectWillChange.send()
+            }
+        }
+    }
+
+    deinit {
+        task?.cancel()
+    }
+}
