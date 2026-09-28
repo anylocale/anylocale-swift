@@ -207,6 +207,15 @@ from the bundle, as before.
 Both swizzles resolve the language the same way as `translate(...)`,
 including a custom locale set on the SDK.
 
+A SwiftUI view built with `Text("key")` resolves its string when it first
+renders and keeps it: a translation that arrives from the network during that
+session shows on the next launch, because SwiftUI does not re-resolve a
+`LocalizedStringKey`. `AnylocaleText` updates in place as soon as the
+download completes, and `NSLocalizedString` and `translate(...)` return the
+new text on their next call. Verified with the SwiftUI example against a
+local server: first launch shows the bundled string in `Text`, the relaunch
+shows the remote one.
+
 ## Language override
 
 ```swift
