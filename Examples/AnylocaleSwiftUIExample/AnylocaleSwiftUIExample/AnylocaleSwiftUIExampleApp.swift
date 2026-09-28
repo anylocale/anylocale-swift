@@ -6,7 +6,7 @@ struct AnylocaleSwiftUIExampleApp: App {
 
     init() {
         Anylocale.shared.initialize(
-            cdn: URL(string: "https://anylocale.com/ota/v1/your-distribution-key")!,
+            cdn: URL(string: "http://127.0.0.1:3005/ota/v1/dk_25cfd507a4b20f8bba75ca1520f7e5b19c5f5a3271644059e554e1da3ed660ca")!,
             enableDebugLogs: true)
 
         Task {
