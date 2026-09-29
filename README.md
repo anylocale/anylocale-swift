@@ -23,7 +23,7 @@ Swift Package Manager, in `Package.swift`:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/anylocale/anylocale-swift", from: "1.0.0")
+    .package(url: "https://github.com/anylocale/anylocale-swift", from: "1.1.0")
 ]
 ```
 
@@ -179,9 +179,17 @@ struct ContentView: View {
 
 Optionally, the SDK can serve Apple's own localization APIs, so existing code
 and plain SwiftUI views pick up remote translations without being rewritten.
-Set the environment variable `ANYLOCALE_ENABLE_SWIZZLING=true` in your scheme
-(Product > Scheme > Edit Scheme... > Run > Arguments) and call `initialize` as
-usual. Two `Bundle` methods are swizzled:
+Pass `enableSwizzling: true` to `initialize`:
+
+```swift
+Anylocale.shared.initialize(cdn: cdnURL, enableSwizzling: true)
+```
+
+The environment variable `ANYLOCALE_ENABLE_SWIZZLING=true` in your scheme
+(Product > Scheme > Edit Scheme... > Run > Arguments) enables it as well, for
+trying it out without touching code; a scheme variable is not present in a
+release build, so a shipped app uses the parameter. Two `Bundle` methods are
+swizzled:
 
 - `localizedString(forKey:value:table:)`, which backs `NSLocalizedString` and
   `String(localized:)`. Used by UIKit and AppKit code.

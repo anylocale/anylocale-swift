@@ -35,6 +35,23 @@ struct BundleSwizzlingTests {
         return context
     }
 
+    @Test func initializeCanEnableSwizzlingWithoutTheEnvironmentVariable() throws {
+        let context = TestContext()
+        context.cache.preload(
+            Data(cachedTranslationsJSON.utf8),
+            for: CacheDescriptor(
+                language: "en", appVersionSignature: "1.0.0-1", cdn: cdnURL.absoluteString))
+        defer { Bundle.unswizzle() }
+
+        context.anylocale.initialize(
+            cdn: cdnURL, locale: Locale(identifier: "en_US"), enableSwizzling: true)
+
+        #expect(Bundle.isSwizzled)
+        #expect(
+            Bundle.module.localizedString(forKey: "Hello, world!", value: nil, table: nil)
+                == "[remote] Hello, world!")
+    }
+
     @Test func localizedStringReturnsRemoteTranslation() throws {
         let context = makeSwizzledContext()
         defer { Bundle.unswizzle() }

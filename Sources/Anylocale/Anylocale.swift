@@ -147,6 +147,10 @@ public final class Anylocale {
     ///   - language: The target language code on the Anylocale CDN (e.g., "en", "pt-BR", "cs"). Use this to override the locale's language when it differs from the CDN language code.
     ///   - namespaces: A set of namespace identifiers for organizing translations into logical groups (defaults to empty set)
     ///   - enableDebugLogs: Whether to enable debug logging (defaults to `false`)
+    ///   - enableSwizzling: Whether to route `NSLocalizedString`, `String(localized:)` and SwiftUI's
+    ///     `Text("key")` through the SDK (defaults to `false`). The `ANYLOCALE_ENABLE_SWIZZLING=true`
+    ///     environment variable enables it as well, which is handy in a scheme but never ships in a
+    ///     release build.
     ///
     /// ## Usage
     /// ```swift
@@ -159,7 +163,8 @@ public final class Anylocale {
         locale customLocale: Locale = .current,
         language customCdnLanguage: String? = nil,
         namespaces: Set<String> = [],
-        enableDebugLogs: Bool = false
+        enableDebugLogs: Bool = false,
+        enableSwizzling: Bool = false
     ) {
 
         guard !isInitialized else {
@@ -169,7 +174,10 @@ public final class Anylocale {
 
         logger.enableDebugLogs = enableDebugLogs
 
-        if ProcessInfo.processInfo.environment["ANYLOCALE_ENABLE_SWIZZLING"] == "true" {
+        if enableSwizzling {
+            logger.debug("Swizzling Bundle methods (enableSwizzling is true)")
+            Bundle.swizzle(translator: self)
+        } else if ProcessInfo.processInfo.environment["ANYLOCALE_ENABLE_SWIZZLING"] == "true" {
             logger.debug("Swizzling Bundle methods (ANYLOCALE_ENABLE_SWIZZLING is set to true)")
             Bundle.swizzle(translator: self)
         }
